@@ -25,7 +25,11 @@ cmd:text("waifu2x-api")
 cmd:text("Options:")
 cmd:option("-port", 8812, 'listen port')
 cmd:option("-gpu", 1, 'Device ID')
+cmd:option("-crop_size", 128, 'patch size per process')
+cmd:option("-batch_size", 1, 'batch size')
 cmd:option("-thread", -1, 'number of CPU threads')
+cmd:option("-force_cudnn", 0, 'use cuDNN backend (0|1)')
+
 local opt = cmd:parse(arg)
 cutorch.setDevice(opt.gpu)
 torch.setdefaulttensortype('torch.FloatTensor')
@@ -34,38 +38,77 @@ if opt.thread > 0 then
 end
 if cudnn then
    cudnn.fastest = true
-   cudnn.benchmark = false
+   cudnn.benchmark = true
 end
-local ART_MODEL_DIR = path.join(ROOT, "models", "anime_style_art_rgb")
-local PHOTO_MODEL_DIR = path.join(ROOT, "models", "photo")
-local art_scale2_model = torch.load(path.join(ART_MODEL_DIR, "scale2.0x_model.t7"), "ascii")
-local art_noise1_model = torch.load(path.join(ART_MODEL_DIR, "noise1_model.t7"), "ascii")
-local art_noise2_model = torch.load(path.join(ART_MODEL_DIR, "noise2_model.t7"), "ascii")
-local art_noise3_model = torch.load(path.join(ART_MODEL_DIR, "noise3_model.t7"), "ascii")
-local photo_scale2_model = torch.load(path.join(PHOTO_MODEL_DIR, "scale2.0x_model.t7"), "ascii")
-local photo_noise1_model = torch.load(path.join(PHOTO_MODEL_DIR, "noise1_model.t7"), "ascii")
-local photo_noise2_model = torch.load(path.join(PHOTO_MODEL_DIR, "noise2_model.t7"), "ascii")
-local photo_noise3_model = torch.load(path.join(PHOTO_MODEL_DIR, "noise3_model.t7"), "ascii")
+opt.force_cudnn = opt.force_cudnn == 1
+local ART_MODEL_DIR = path.join(ROOT, "models", "upconv_7", "art")
+local PHOTO_MODEL_DIR = path.join(ROOT, "models", "upconv_7", "photo")
+local art_model = {
+   scale = w2nn.load_model(path.join(ART_MODEL_DIR, "scale2.0x_model.t7"), opt.force_cudnn),
+   noise0_scale = w2nn.load_model(path.join(ART_MODEL_DIR, "noise0_scale2.0x_model.t7"), opt.force_cudnn),
+   noise1_scale = w2nn.load_model(path.join(ART_MODEL_DIR, "noise1_scale2.0x_model.t7"), opt.force_cudnn),
+   noise2_scale = w2nn.load_model(path.join(ART_MODEL_DIR, "noise2_scale2.0x_model.t7"), opt.force_cudnn),
+   noise3_scale = w2nn.load_model(path.join(ART_MODEL_DIR, "noise3_scale2.0x_model.t7"), opt.force_cudnn),
+   noise0 = w2nn.load_model(path.join(ART_MODEL_DIR, "noise0_model.t7"), opt.force_cudnn),
+   noise1 = w2nn.load_model(path.join(ART_MODEL_DIR, "noise1_model.t7"), opt.force_cudnn),
+   noise2 = w2nn.load_model(path.join(ART_MODEL_DIR, "noise2_model.t7"), opt.force_cudnn),
+   noise3 = w2nn.load_model(path.join(ART_MODEL_DIR, "noise3_model.t7"), opt.force_cudnn)
+}
+local photo_model = {
+   scale = w2nn.load_model(path.join(PHOTO_MODEL_DIR, "scale2.0x_model.t7"), opt.force_cudnn),
+   noise0_scale = w2nn.load_model(path.join(PHOTO_MODEL_DIR, "noise0_scale2.0x_model.t7"), opt.force_cudnn),
+   noise1_scale = w2nn.load_model(path.join(PHOTO_MODEL_DIR, "noise1_scale2.0x_model.t7"), opt.force_cudnn),
+   noise2_scale = w2nn.load_model(path.join(PHOTO_MODEL_DIR, "noise2_scale2.0x_model.t7"), opt.force_cudnn),
+   noise3_scale = w2nn.load_model(path.join(PHOTO_MODEL_DIR, "noise3_scale2.0x_model.t7"), opt.force_cudnn),
+   noise0 = w2nn.load_model(path.join(PHOTO_MODEL_DIR, "noise0_model.t7"), opt.force_cudnn),
+   noise1 = w2nn.load_model(path.join(PHOTO_MODEL_DIR, "noise1_model.t7"), opt.force_cudnn),
+   noise2 = w2nn.load_model(path.join(PHOTO_MODEL_DIR, "noise2_model.t7"), opt.force_cudnn),
+   noise3 = w2nn.load_model(path.join(PHOTO_MODEL_DIR, "noise3_model.t7"), opt.force_cudnn)
+}
+collectgarbage()
 local CLEANUP_MODEL = false -- if you are using the low memory GPU, you could use this flag.
 local CACHE_DIR = path.join(ROOT, "cache")
-local MAX_NOISE_IMAGE = 2560 * 2560
-local MAX_SCALE_IMAGE = 1280 * 1280
+local MAX_NOISE_IMAGE = 3000 * 3000
+local MAX_SCALE_IMAGE = 1500 * 1500
 local CURL_OPTIONS = {
    request_timeout = 60,
    connect_timeout = 60,
    allow_redirects = true,
    max_redirects = 2
 }
-local CURL_MAX_SIZE = 3 * 1024 * 1024
+local CURL_MAX_SIZE = 5 * 1024 * 1024
 
-local function valid_size(x, scale)
-   if scale == 0 then
-      return x:size(2) * x:size(3) <= MAX_NOISE_IMAGE
+local function valid_size(x, scale, tta_level)
+   if scale <= 0 then
+      local limit = math.pow(math.floor(math.pow(MAX_NOISE_IMAGE / tta_level, 0.5)), 2)
+      return x:size(2) * x:size(3) <= limit
    else
-      return x:size(2) * x:size(3) <= MAX_SCALE_IMAGE
+      local limit = math.pow(math.floor(math.pow(MAX_SCALE_IMAGE / tta_level, 0.5)), 2)
+      return x:size(2) * x:size(3) <= limit
    end
 end
-
+local function auto_tta_level(x, scale)
+   local limit2, limit4, limit8
+   if scale <= 0 then
+      limit2 = math.pow(math.floor(math.pow(MAX_NOISE_IMAGE / 2, 0.5)), 2)
+      limit4 = math.pow(math.floor(math.pow(MAX_NOISE_IMAGE / 4, 0.5)), 2)
+      limit8 = math.pow(math.floor(math.pow(MAX_NOISE_IMAGE / 8, 0.5)), 2)
+   else
+      limit2 = math.pow(math.floor(math.pow(MAX_SCALE_IMAGE / 2, 0.5)), 2)
+      limit4 = math.pow(math.floor(math.pow(MAX_SCALE_IMAGE / 4, 0.5)), 2)
+      limit8 = math.pow(math.floor(math.pow(MAX_SCALE_IMAGE / 8, 0.5)), 2)
+   end
+   local px = x:size(2) * x:size(3)
+   if px <= limit8 then
+      return 8
+   elseif px <= limit4 then
+      return 4
+   elseif px <= limit2 then
+      return 2
+   else
+      return 1
+   end
+end
 local function cache_url(url)
    local hash = md5.sumhexa(url)
    local cache_file = path.join(CACHE_DIR, "url_" .. hash)
@@ -91,7 +134,7 @@ local function cache_url(url)
 	 end
       end
    end
-   return nil, nil, nil
+   return nil, nil
 end
 local function get_image(req)
    local file_info = req:get_arguments("file")
@@ -106,22 +149,23 @@ local function get_image(req)
       end
    end
    if file and file:len() > 0 then
-      local x, alpha, blob = image_loader.decode_float(file)
-      return x, alpha, blob, filename
+      local x, meta = image_loader.decode_float(file)
+      return x, meta, filename
    elseif url and url:len() > 0 then
-      local x, alpha, blob = cache_url(url)
-      return x, alpha, blob, filename
+      local x, meta = cache_url(url)
+      return x, meta, filename
    end
-   return nil, nil, nil, nil
+   return nil, nil, nil
 end
 local function cleanup_model(model)
    if CLEANUP_MODEL then
       model:clearState() -- release GPU memory
    end
 end
-local function convert(x, alpha, options)
+local function convert(x, meta, options)
    local cache_file = path.join(CACHE_DIR, options.prefix .. ".png")
    local alpha_cache_file = path.join(CACHE_DIR, options.alpha_prefix .. ".png")
+   local alpha = meta.alpha
    local alpha_orig = alpha
 
    if path.exists(alpha_cache_file) then
@@ -135,58 +179,49 @@ local function convert(x, alpha, options)
    end
    if path.exists(cache_file) then
       x = image_loader.load_float(cache_file)
-      return x, alpha
+      meta = tablex.copy(meta)
+      meta.alpha = alpha
+      return x, meta
    else
+      local model = nil
       if options.style == "art" then
-	 if options.border then
-	    x = alpha_util.make_border(x, alpha_orig, reconstruct.offset_size(art_scale2_model))
-	 end
-	 if options.method == "scale" then
-	    x = reconstruct.scale(art_scale2_model, 2.0, x)
-	    if alpha then
-	       if not (alpha:size(2) == x:size(2) and alpha:size(3) == x:size(3)) then
-		  alpha = reconstruct.scale(art_scale2_model, 2.0, alpha)
-		  image_loader.save_png(alpha_cache_file, alpha)
-	       end
+	 model = art_model
+      elseif options.style == "photo" then
+	 model = photo_model
+      end
+      if options.border then
+	 x = alpha_util.make_border(x, alpha_orig, reconstruct.offset_size(model.scale))
+      end
+      if (options.method == "scale" or
+	     options.method == "noise0_scale" or
+	     options.method == "noise1_scale" or
+	     options.method == "noise2_scale" or
+	     options.method == "noise3_scale")
+      then
+	 x = reconstruct.scale_tta(model[options.method], options.tta_level, 2.0, x,
+				   opt.crop_size, opt.batch_size)
+	 if alpha then
+	    if not (alpha:size(2) == x:size(2) and alpha:size(3) == x:size(3)) then
+	       alpha = reconstruct.scale(model.scale, 2.0, alpha,
+					 opt.crop_size, opt.batch_size)
+	       image_loader.save_png(alpha_cache_file, alpha)
+	       cleanup_model(model.scale)
 	    end
-	    cleanup_model(art_scale2_model)
-	 elseif options.method == "noise1" then
-	    x = reconstruct.image(art_noise1_model, x)
-	    cleanup_model(art_noise1_model)
-	 elseif options.method == "noise2" then
-	    x = reconstruct.image(art_noise2_model, x)
-	    cleanup_model(art_noise2_model)
-	 elseif options.method == "noise3" then
-	    x = reconstruct.image(art_noise3_model, x)
-	    cleanup_model(art_noise3_model)
 	 end
-      else -- photo
-	 if options.border then
-	    x = alpha_util.make_border(x, alpha, reconstruct.offset_size(photo_scale2_model))
-	 end
-	 if options.method == "scale" then
-	    x = reconstruct.scale(photo_scale2_model, 2.0, x)
-	    if alpha then
-	       if not (alpha:size(2) == x:size(2) and alpha:size(3) == x:size(3)) then
-		  alpha = reconstruct.scale(photo_scale2_model, 2.0, alpha)
-		  image_loader.save_png(alpha_cache_file, alpha)
-	       end
-	    end
-	    cleanup_model(photo_scale2_model)
-	 elseif options.method == "noise1" then
-	    x = reconstruct.image(photo_noise1_model, x)
-	    cleanup_model(photo_noise1_model)
-	 elseif options.method == "noise2" then
-	    x = reconstruct.image(photo_noise2_model, x)
-	    cleanup_model(photo_noise2_model)
-	 elseif options.method == "noise3" then
-	    x = reconstruct.image(photo_noise3_model, x)
-	    cleanup_model(photo_noise3_model)
-	 end
+	 cleanup_model(model[options.method])
+      elseif (options.method == "noise0" or
+		 options.method == "noise1" or
+		 options.method == "noise2" or
+		 options.method == "noise3")
+      then
+	 x = reconstruct.image_tta(model[options.method], options.tta_level,
+				   x, opt.crop_size, opt.batch_size)
+	 cleanup_model(model[options.method])
       end
       image_loader.save_png(cache_file, x)
-
-      return x, alpha
+      meta = tablex.copy(meta)
+      meta.alpha = alpha
+      return x, meta
    end
 end
 local function client_disconnected(handler)
@@ -212,57 +247,62 @@ function APIHandler:post()
       self:write("client disconnected")
       return
    end
-   local x, alpha, blob, filename = get_image(self)
-   local scale = tonumber(self:get_argument("scale", "0"))
-   local noise = tonumber(self:get_argument("noise", "0"))
+   local x, meta, filename = get_image(self)
+   local scale = tonumber(self:get_argument("scale", "-1"))
+   local noise = tonumber(self:get_argument("noise", "-1"))
+   local tta_level = tonumber(self:get_argument("tta_level", "1"))
    local style = self:get_argument("style", "art")
    local download = (self:get_argument("download", "")):len()
 
+   if tta_level == 0 then
+      tta_level = auto_tta_level(x, scale)
+   end
+   if not (tta_level == 0 or tta_level == 1 or tta_level == 2 or tta_level == 4 or tta_level == 8) then
+      tta_level = 1
+   end
    if style ~= "art" then
       style = "photo" -- style must be art or photo
    end
-   if x and valid_size(x, scale) then
+   if x and valid_size(x, scale, tta_level) then
       local prefix = nil
-      if (noise ~= 0 or scale ~= 0) then
-	 local hash = md5.sumhexa(blob)
+      if (noise >= 0 or scale > 0) then
+	 local hash = md5.sumhexa(meta.blob)
 	 local alpha_prefix = style .. "_" .. hash .. "_alpha"
 	 local border = false
-	 if scale ~= 0 and alpha then
+	 if scale >= 0 and meta.alpha then
 	    border = true
 	 end
-	 if noise == 1 then
-	    prefix = style .. "_noise1_"
-	    x = convert(x, alpha, {method = "noise1", style = style,
-				   prefix = prefix .. hash,
-				   alpha_prefix = alpha_prefix, border = border})
-	    border = false
-	 elseif noise == 2 then
-	    prefix = style .. "_noise2_"
-	    x = convert(x, alpha, {method = "noise2", style = style,
-				   prefix = prefix .. hash, 
-				   alpha_prefix = alpha_prefix, border = border})
-	    border = false
-	 elseif noise == 3 then
-	    prefix = style .. "_noise3_"
-	    x = convert(x, alpha, {method = "noise3", style = style,
-				   prefix = prefix .. hash, 
-				   alpha_prefix = alpha_prefix, border = border})
-	    border = false
-	 end
-	 if scale == 1 or scale == 2 then
-	    if noise == 1 then
-	       prefix = style .. "_noise1_scale_"
-	    elseif noise == 2 then
-	       prefix = style .. "_noise2_scale_"
-	    elseif noise == 3 then
-	       prefix = style .. "_noise3_scale_"
-	    else
-	       prefix = style .. "_scale_"
-	    end
-	    x, alpha = convert(x, alpha, {method = "scale", style = style, prefix = prefix .. hash, alpha_prefix = alpha_prefix, border = border})
+	 if (scale == 1 or scale == 2) and (noise < 0) then
+	    prefix = style .. "_scale_tta_"  .. tta_level .. "_"
+	    x, meta = convert(x, meta, {method = "scale",
+					style = style,
+					tta_level = tta_level,
+					prefix = prefix .. hash,
+					alpha_prefix = alpha_prefix,
+					border = border})
 	    if scale == 1 then
 	       x = iproc.scale(x, x:size(3) * (1.6 / 2.0), x:size(2) * (1.6 / 2.0), "Sinc")
 	    end
+	 elseif (scale == 1 or scale == 2) and (noise == 0 or noise == 1 or noise == 2 or noise == 3) then
+	    prefix = style .. string.format("_noise%d_scale_tta_", noise)  .. tta_level .. "_"
+	    x, meta = convert(x, meta, {method = string.format("noise%d_scale", noise),
+					style = style,
+					tta_level = tta_level,
+					prefix = prefix .. hash,
+					alpha_prefix = alpha_prefix,
+					border = border})
+	    if scale == 1 then
+	       x = iproc.scale(x, x:size(3) * (1.6 / 2.0), x:size(2) * (1.6 / 2.0), "Sinc")
+	    end
+	 elseif (noise == 0 or noise == 1 or noise == 2 or noise == 3) then
+	    prefix = style .. string.format("_noise%d_tta_", noise) .. tta_level .. "_"
+	    x = convert(x, meta, {method = string.format("noise%d", noise), 
+				  style = style, 
+				  tta_level = tta_level,
+				  prefix = prefix .. hash,
+				  alpha_prefix = alpha_prefix,
+				  border = border})
+	    border = false
 	 end
       end
       local name = nil
@@ -275,7 +315,8 @@ function APIHandler:post()
       else
 	 name = uuid() .. ".png"
       end
-      local blob = image_loader.encode_png(alpha_util.composite(x, alpha), 8, true)
+      local blob = image_loader.encode_png(alpha_util.composite(x, meta.alpha),
+					   tablex.update({depth = 8, inplace = true}, meta))
 
       self:set_header("Content-Length", string.format("%d", #blob))
       if download > 0 then
@@ -306,6 +347,7 @@ local index_fr = file.read(path.join(ROOT, "assets", "index.fr.html"))
 local index_de = file.read(path.join(ROOT, "assets", "index.de.html"))
 local index_tr = file.read(path.join(ROOT, "assets", "index.tr.html"))
 local index_zh_cn = file.read(path.join(ROOT, "assets", "index.zh-CN.html"))
+local index_zh_tw = file.read(path.join(ROOT, "assets", "index.zh-TW.html"))
 local index_ko = file.read(path.join(ROOT, "assets", "index.ko.html"))
 local index_en = file.read(path.join(ROOT, "assets", "index.html"))
 function FormHandler:get()
@@ -331,6 +373,8 @@ function FormHandler:get()
 	 self:write(index_tr)
       elseif langs[1] == "zh-CN" or langs[1] == "zh" then
 	 self:write(index_zh_cn)
+      elseif langs[1] == "zh-TW" then
+	 self:write(index_zh_tw)
       elseif langs[1] == "ko" then
 	 self:write(index_ko)
       else

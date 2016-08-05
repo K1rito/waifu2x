@@ -54,6 +54,10 @@
 	  简体中文
 	</a>
 	/
+	<a href="index.zh-TW.html">
+	  繁體中文
+	</a>
+	/
 	<a href="index.ko.html">
 	  한국어
 	</a>
@@ -77,8 +81,8 @@
 	      或者从本地上传: 
 	      <input type="file" id="file" name="file"></div>
 	  </div>
-	  <div class="option-hint">
-	    文件大小不得超过3MB；可降噪图像的最大尺寸：2560x2560px；可放大图像的最大尺寸：1280x1280px。
+	  <div class="option-hint file_limits">
+	    文件大小不得超过5MB；可降噪图像的最大尺寸：3000x3000px；可放大图像的最大尺寸：1500x1500px。
 	  </div>
 	</div>
 	<div class="option-box">
@@ -106,9 +110,14 @@
 	    </div>
 	  </div>
 	  <div class="option-right">
-	    <label><input type="radio" name="noise" class="radio" value="0">
+	    <label><input type="radio" name="noise" class="radio" value="-1">
 	      <span class="r-text">
 		不降噪
+	      </span>
+	    </label>
+	    <label><input type="radio" name="noise" class="radio" value="0" checked>
+	      <span class="r-text">
+		Low
 	      </span>
 	    </label>
 	    <label><input type="radio" name="noise" class="radio" value="1" checked>
@@ -139,7 +148,7 @@
 	    <div class="option-left-small"></div>
 	  </div>
 	  <div class="option-right">
-	    <label><input type="radio" name="scale" class="radio" value="0" checked>
+	    <label><input type="radio" name="scale" class="radio" value="-1" checked>
 	      <span class="r-text">
 		不放大
 	      </span>
@@ -156,6 +165,7 @@
 	    </label>
 	  </div>
 	</div>
+	
 	
 	  <input type="submit" class="button" value="转换">
 	
